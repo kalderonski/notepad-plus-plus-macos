@@ -5,50 +5,73 @@
 extern NSString *const kPrefLargeFileEnabled;
 extern NSString *const kPrefLargeFileSizeMB;
 
-// Chooses which part of a huge file to open. The From slider is a percentage of the
-// file; Size is in MB. Labels update live as the sliders move.
+// Decimal size text (1 GB = 1e9 bytes), as in the status bar.
+static NSString *NppChooserSizeText(unsigned long long bytes) {
+    if (bytes >= 1000000000ULL) return [NSString stringWithFormat:@"%.2f GB", (double)bytes / 1e9];
+    return [NSString stringWithFormat:@"%.1f MB", (double)bytes / 1e6];
+}
+
+// Chooses which part of a huge file to open. "Start at" is a percentage of the file;
+// "Open" is a size in MB. Both labels and the summary line update as the sliders move.
 @interface _NppSectionChooser : NSObject
 @property (nonatomic, strong) NSSlider *fromSlider, *sizeSlider;
-@property (nonatomic, strong) NSTextField *fromLabel, *sizeLabel;
+@property (nonatomic, strong) NSTextField *fromLabel, *sizeLabel, *summaryLabel;
+@property (nonatomic) unsigned long long total;
 @end
 @implementation _NppSectionChooser
 - (void)changed:(id)sender {
-    self.fromLabel.stringValue = [NSString stringWithFormat:@"From: %d%%", (int)round(self.fromSlider.doubleValue)];
-    self.sizeLabel.stringValue = [NSString stringWithFormat:@"Size: %d MB", (int)round(self.sizeSlider.doubleValue)];
+    double pct = self.fromSlider.doubleValue;
+    unsigned long long size = (unsigned long long)round(self.sizeSlider.doubleValue) * 1000000ULL;
+    unsigned long long start = (unsigned long long)(pct / 100.0 * (double)self.total);
+    unsigned long long end = MIN(self.total, start + size);
+    self.fromLabel.stringValue = [NSString stringWithFormat:@"Start at: %d%% of the file", (int)round(pct)];
+    self.sizeLabel.stringValue = [NSString stringWithFormat:@"Open: %d MB", (int)round(self.sizeSlider.doubleValue)];
+    self.summaryLabel.stringValue = [NSString stringWithFormat:@"You will see bytes %@ to %@ of %@.",
+        NppChooserSizeText(start), NppChooserSizeText(end), NppChooserSizeText(self.total)];
 }
 @end
 
 typedef NS_ENUM(NSInteger, NppOpenChoice) { NppOpenChoiceSection, NppOpenChoiceWhole, NppOpenChoiceCancel };
 
-// Asks how to open a huge file. On "Open Section", returns the byte range to load.
+// Asks how to open a huge file. On "Open This Part", returns the byte range to load.
 static NppOpenChoice NppChooseOpenMode(NSString *path, unsigned long long total,
                                        unsigned long long *outOffset, unsigned long long *outLength) {
-    NSInteger sizeMB = [[NSUserDefaults standardUserDefaults] integerForKey:kPrefLargeFileSizeMB];
-    (void)sizeMB;   // threshold check happens in the caller
     _NppSectionChooser *chooser = [[_NppSectionChooser alloc] init];
-    NSView *box = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 360, 96)];
-    chooser.fromLabel = [NSTextField labelWithString:@"From: 0%"];
-    chooser.fromLabel.frame = NSMakeRect(0, 66, 360, 18);
+    chooser.total = total;
+    NSView *box = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 380, 150)];
+    chooser.summaryLabel = [NSTextField labelWithString:@""];
+    chooser.summaryLabel.font = [NSFont boldSystemFontOfSize:NSFont.systemFontSize];
+    chooser.summaryLabel.frame = NSMakeRect(0, 128, 380, 18);
+    chooser.fromLabel = [NSTextField labelWithString:@""];
+    chooser.fromLabel.frame = NSMakeRect(0, 100, 380, 18);
     chooser.fromSlider = [NSSlider sliderWithValue:0 minValue:0 maxValue:100 target:chooser action:@selector(changed:)];
-    chooser.fromSlider.frame = NSMakeRect(0, 44, 360, 22);
-    chooser.sizeLabel = [NSTextField labelWithString:@"Size: 64 MB"];
-    chooser.sizeLabel.frame = NSMakeRect(0, 22, 360, 18);
+    chooser.fromSlider.frame = NSMakeRect(0, 78, 380, 22);
+    chooser.sizeLabel = [NSTextField labelWithString:@""];
+    chooser.sizeLabel.frame = NSMakeRect(0, 54, 380, 18);
     chooser.sizeSlider = [NSSlider sliderWithValue:64 minValue:1 maxValue:256 target:chooser action:@selector(changed:)];
-    chooser.sizeSlider.frame = NSMakeRect(0, 0, 360, 22);
-    for (NSView *v in @[chooser.fromLabel, chooser.fromSlider, chooser.sizeLabel, chooser.sizeSlider]) [box addSubview:v];
+    chooser.sizeSlider.frame = NSMakeRect(0, 32, 380, 22);
+    NSTextField *wholeNote = [NSTextField wrappingLabelWithString:
+        [NSString stringWithFormat:@"Open the Whole File is slower and needs at least %@ of memory.", NppChooserSizeText(total)]];
+    wholeNote.font = [NSFont systemFontOfSize:NSFont.smallSystemFontSize];
+    wholeNote.textColor = NSColor.secondaryLabelColor;
+    wholeNote.frame = NSMakeRect(0, 0, 380, 30);
+    for (NSView *v in @[chooser.summaryLabel, chooser.fromLabel, chooser.fromSlider,
+                        chooser.sizeLabel, chooser.sizeSlider, wholeNote]) [box addSubview:v];
+    [chooser changed:nil];
 
     NSAlert *alert = [[NSAlert alloc] init];
-    alert.messageText = [NSString stringWithFormat:@"%@ is large", path.lastPathComponent];
-    alert.informativeText = @"Open only part of the file. The rest stays on disk. Line breaks are adjusted to keep whole lines.";
+    alert.messageText = [NSString stringWithFormat:@"%@ is %@", path.lastPathComponent, NppChooserSizeText(total)];
+    alert.informativeText = @"Opening it whole is slow. Open one part now; move between parts "
+                            @"from View \u25B8 Large File Sections.";
     alert.accessoryView = box;
-    [alert addButtonWithTitle:@"Open Section"];
-    [alert addButtonWithTitle:@"Load Whole File"];
+    [alert addButtonWithTitle:@"Open This Part"];
+    [alert addButtonWithTitle:@"Open the Whole File"];
     [alert addButtonWithTitle:@"Cancel"];
     NSModalResponse r = [alert runModal];
     if (r == NSAlertFirstButtonReturn) {
         double fromPct = chooser.fromSlider.doubleValue / 100.0;
         *outOffset = (unsigned long long)(fromPct * (double)total);
-        *outLength = (unsigned long long)chooser.sizeSlider.doubleValue * 1000000ULL;   // decimal MB, as in the status bar
+        *outLength = (unsigned long long)round(chooser.sizeSlider.doubleValue) * 1000000ULL;   // decimal MB, as in the status bar
         return NppOpenChoiceSection;
     }
     return r == NSAlertSecondButtonReturn ? NppOpenChoiceWhole : NppOpenChoiceCancel;

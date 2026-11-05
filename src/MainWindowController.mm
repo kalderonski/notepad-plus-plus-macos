@@ -1594,6 +1594,43 @@ static const CGFloat kTGLabelGap = 3.0;   // gap between icon row and label
 static const CGFloat kTGLabelH   = 14.0;  // label row height
 static const CGFloat kTGRadius   = 12.0;  // pill corner radius (rounded, mockup-like)
 
+// A thin map of a large file: the highlighted block is the part now loaded. Dragging or
+// clicking moves the block; the new start (as a fraction of the file) is sent on mouse up.
+@interface NppSectionBarView : NSView
+@property (nonatomic) double startFraction;   // 0...1
+@property (nonatomic) double widthFraction;   // 0...1
+@property (nonatomic, copy) void (^onPick)(double startFraction);
+@end
+@implementation NppSectionBarView {
+    BOOL _dragging;
+    double _dragStart;
+}
+- (void)drawRect:(NSRect)dirty {
+    NSRect track = NSInsetRect(self.bounds, 0, (self.bounds.size.height - 10) / 2);
+    [[NSColor quaternaryLabelColor] setFill];
+    [[NSBezierPath bezierPathWithRoundedRect:track xRadius:5 yRadius:5] fill];
+    double start = _dragging ? _dragStart : _startFraction;
+    CGFloat w = MAX(6.0, track.size.width * _widthFraction);
+    CGFloat x = NSMinX(track) + MIN(MAX(0, start), 1.0 - _widthFraction) * track.size.width;
+    [[NSColor controlAccentColor] setFill];
+    [[NSBezierPath bezierPathWithRoundedRect:NSMakeRect(x, NSMinY(track), w, track.size.height)
+                                     xRadius:5 yRadius:5] fill];
+}
+- (double)_fractionForEvent:(NSEvent *)e {
+    NSPoint p = [self convertPoint:e.locationInWindow fromView:nil];
+    double f = p.x / MAX(1.0, self.bounds.size.width) - _widthFraction / 2.0;   // block centred on the pointer
+    return MIN(MAX(0, f), MAX(0, 1.0 - _widthFraction));
+}
+- (void)mouseDown:(NSEvent *)e { _dragging = YES; _dragStart = [self _fractionForEvent:e]; [self setNeedsDisplay:YES]; }
+- (void)mouseDragged:(NSEvent *)e { _dragStart = [self _fractionForEvent:e]; [self setNeedsDisplay:YES]; }
+- (void)mouseUp:(NSEvent *)e {
+    double f = [self _fractionForEvent:e];
+    _dragging = NO;
+    [self setNeedsDisplay:YES];
+    if (self.onPick) self.onPick(f);
+}
+@end
+
 @interface NppTahoeGroupView : NSView <NppToolbarOverflowMenuProviding>
 - (instancetype)initWithButtons:(NSArray<NSButton *> *)buttons
                           label:(NSString *)label
@@ -2015,6 +2052,13 @@ static void _nppTahoeRoundEditorCard(NSView *container, NSView *content) {
     FindReplacePanel *_findPanel;
     NSView           *_statusBar;
     NSTextField      *_statusLeft;
+    NSButton         *_sectionButton;                  // status bar: "Bytes A to B of C ⌄" (large-file section mode)
+    NSLayoutConstraint *_statusLeftAtEdge;             // _statusLeft at the bar's left edge
+    NSLayoutConstraint *_statusLeftAfterSection;       // _statusLeft after the section button
+    NSPopover        *_sectionPopover;
+    NppSectionBarView *_sectionBar;
+    NSTextField      *_sectionPartLabel;
+    NSTextField      *_sectionOffsetField;
     NSTextField      *_statusRight;
     NSTextField      *_gitBranchLabel;
     NSLayoutConstraint *_findPanelHeightConstraint;
@@ -2297,7 +2341,7 @@ static void _nppTahoeRoundEditorCard(NSView *container, NSView *content) {
     if (ed.isModified) {
         NSAlert *alert = [[NSAlert alloc] init];
         alert.messageText = @"This section has unsaved changes";
-        alert.informativeText = @"Saving sections is not available yet, so moving to another section is blocked to keep your edits.";
+        alert.informativeText = @"Save this part first (Command-S), then move to another part, so your edits are not lost.";
         [alert runModal];
         return;
     }
@@ -2340,6 +2384,85 @@ static void _nppTahoeRoundEditorCard(NSView *container, NSView *content) {
     unsigned long long offset = (unsigned long long)(mb * 1000000.0);
     if (offset > ed.totalFileSize) offset = ed.totalFileSize;
     [self _moveToSectionAtOffset:offset];
+}
+
+// ── Status bar: part chooser ────────────────────────────────────────────────
+
+- (void)_refreshSectionPopover {
+    EditorView *ed = [self currentEditor];
+    if (!_sectionPopover || !ed.isSectionMode) return;
+    double total = MAX(1.0, (double)ed.totalFileSize);
+    _sectionBar.startFraction = (double)ed.sectionStart / total;
+    _sectionBar.widthFraction = MAX(0.001, (double)(ed.sectionEnd - ed.sectionStart) / total);
+    [_sectionBar setNeedsDisplay:YES];
+    unsigned long long step = MAX(1ULL, ed.requestedSectionLength);
+    unsigned long long part = ed.sectionStart / step + 1;
+    unsigned long long parts = (ed.totalFileSize + step - 1) / step;
+    _sectionPartLabel.stringValue = [NSString stringWithFormat:@"Part %llu of %llu", part, parts];
+}
+
+// Opens the part chooser from the status bar range: a map of the file, Previous and Next,
+// and a go-to field. Every control uses the same commands as View > Large File Sections.
+- (void)showSectionPopover:(id)sender {
+    if (_sectionPopover.shown) { [_sectionPopover close]; return; }
+    EditorView *ed = [self currentEditor];
+    if (!ed.isSectionMode) return;
+
+    NSView *box = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 232, 84)];
+    const CGFloat small = NSFont.smallSystemFontSize;
+    _sectionPartLabel = [NSTextField labelWithString:@""];
+    _sectionPartLabel.font = [NSFont boldSystemFontOfSize:small];
+    _sectionPartLabel.frame = NSMakeRect(10, 64, 212, 14);
+
+    _sectionBar = [[NppSectionBarView alloc] initWithFrame:NSMakeRect(10, 44, 212, 16)];
+    __weak MainWindowController *weakSelf = self;
+    _sectionBar.onPick = ^(double f) {
+        MainWindowController *me = weakSelf;
+        EditorView *cur = [me currentEditor];
+        if (!me || !cur.isSectionMode) return;
+        [me _moveToSectionAtOffset:(unsigned long long)(f * (double)cur.totalFileSize)];
+        [me _refreshSectionPopover];
+    };
+
+    NSButton *prev = [NSButton buttonWithTitle:@"\u25C0 Prev" target:self action:@selector(_sectionPopoverPrevious:)];
+    NSButton *next = [NSButton buttonWithTitle:@"Next \u25B6" target:self action:@selector(_sectionPopoverNext:)];
+    for (NSButton *b in @[prev, next]) { b.controlSize = NSControlSizeSmall; b.font = [NSFont systemFontOfSize:small]; }
+    prev.frame = NSMakeRect(10, 20, 66, 20);
+    next.frame = NSMakeRect(80, 20, 66, 20);
+
+    NSTextField *gotoLabel = [NSTextField labelWithString:@"Go to (MB)"];
+    gotoLabel.font = [NSFont systemFontOfSize:small];
+    gotoLabel.frame = NSMakeRect(10, 2, 62, 14);
+    _sectionOffsetField = [[NSTextField alloc] initWithFrame:NSMakeRect(74, 0, 96, 18)];
+    _sectionOffsetField.controlSize = NSControlSizeSmall;
+    _sectionOffsetField.font = [NSFont systemFontOfSize:small];
+    _sectionOffsetField.placeholderString = [NSString stringWithFormat:@"0 to %.0f", ed.totalFileSize / 1000000.0];
+    _sectionOffsetField.target = self;
+    _sectionOffsetField.action = @selector(_sectionPopoverGoto:);   // Return
+    NSButton *go = [NSButton buttonWithTitle:@"Go" target:self action:@selector(_sectionPopoverGoto:)];
+    go.controlSize = NSControlSizeSmall;
+    go.font = [NSFont systemFontOfSize:small];
+    go.frame = NSMakeRect(174, -1, 48, 20);
+
+    for (NSView *v in @[_sectionPartLabel, _sectionBar, prev, next, gotoLabel, _sectionOffsetField, go]) [box addSubview:v];
+    NSViewController *vc = [[NSViewController alloc] init];
+    vc.view = box;
+    _sectionPopover = [[NSPopover alloc] init];
+    _sectionPopover.behavior = NSPopoverBehaviorTransient;
+    _sectionPopover.contentViewController = vc;
+    [self _refreshSectionPopover];
+    [_sectionPopover showRelativeToRect:_sectionButton.bounds ofView:_sectionButton preferredEdge:NSRectEdgeMinY];
+}
+
+- (void)_sectionPopoverPrevious:(id)sender { [self previousSection:sender]; [self _refreshSectionPopover]; }
+- (void)_sectionPopoverNext:(id)sender     { [self nextSection:sender];     [self _refreshSectionPopover]; }
+- (void)_sectionPopoverGoto:(id)sender {
+    EditorView *ed = [self currentEditor];
+    if (!ed.isSectionMode || !_sectionOffsetField.stringValue.length) return;
+    double mb = MAX(0.0, _sectionOffsetField.doubleValue);
+    unsigned long long offset = MIN((unsigned long long)(mb * 1000000.0), ed.totalFileSize);
+    [self _moveToSectionAtOffset:offset];
+    [self _refreshSectionPopover];
 }
 
 #pragma mark - Window opacity (see through the app while reading)
@@ -4385,6 +4508,14 @@ static BOOL groupHasTrailingSep(NSString *ident) {
     _gitBranchLabel = [self makeStatusLabel:NSTextAlignmentRight];
     _gitBranchLabel.textColor = [NSColor secondaryLabelColor];
     [_statusBar addSubview:_statusLeft];
+    _sectionButton = [NSButton buttonWithTitle:@"" target:self action:@selector(showSectionPopover:)];
+    _sectionButton.bezelStyle = NSBezelStyleRecessed;
+    _sectionButton.showsBorderOnlyWhileMouseInside = YES;   // a light pill on hover: it is clickable
+    _sectionButton.font = _statusLeft.font;
+    _sectionButton.toolTip = @"Large file: choose which part to show";
+    _sectionButton.translatesAutoresizingMaskIntoConstraints = NO;
+    _sectionButton.hidden = YES;
+    [_statusBar addSubview:_sectionButton];
     [_statusBar addSubview:_statusRight];
     [_statusBar addSubview:_gitBranchLabel];
 
@@ -4400,12 +4531,22 @@ static BOOL groupHasTrailingSep(NSString *ident) {
     langClick.delaysPrimaryMouseButtonEvents = NO;
     [_statusBar addGestureRecognizer:langClick];
 
+    // A single click on "Ln x, Col y" opens Go to… (Search > Go to…), as in Notepad++.
+    NSClickGestureRecognizer *lineClick =
+        [[NSClickGestureRecognizer alloc] initWithTarget:self action:@selector(_statusBarLineClicked:)];
+    lineClick.delaysPrimaryMouseButtonEvents = NO;
+    [_statusBar addGestureRecognizer:lineClick];
+
+    _statusLeftAtEdge = [_statusLeft.leadingAnchor constraintEqualToAnchor:_statusBar.leadingAnchor constant:8];
+    _statusLeftAfterSection = [_statusLeft.leadingAnchor constraintEqualToAnchor:_sectionButton.trailingAnchor constant:8];
+    _statusLeftAtEdge.active = YES;
     [NSLayoutConstraint activateConstraints:@[
         [sep.topAnchor constraintEqualToAnchor:_statusBar.topAnchor],
         [sep.leadingAnchor constraintEqualToAnchor:_statusBar.leadingAnchor],
         [sep.trailingAnchor constraintEqualToAnchor:_statusBar.trailingAnchor],
         [sep.heightAnchor constraintEqualToConstant:1],
-        [_statusLeft.leadingAnchor constraintEqualToAnchor:_statusBar.leadingAnchor constant:8],
+        [_sectionButton.leadingAnchor constraintEqualToAnchor:_statusBar.leadingAnchor constant:4],
+        [_sectionButton.centerYAnchor constraintEqualToAnchor:_statusBar.centerYAnchor constant:1],
         [_statusLeft.centerYAnchor constraintEqualToAnchor:_statusBar.centerYAnchor constant:1],
         [_statusLeft.trailingAnchor constraintLessThanOrEqualToAnchor:_statusBar.centerXAnchor],
         [_statusRight.trailingAnchor constraintEqualToAnchor:_statusBar.trailingAnchor constant:-8],
@@ -4776,6 +4917,11 @@ static BOOL groupHasTrailingSep(NSString *ident) {
         NSMutableDictionary *info = [NSMutableDictionary dictionary];
 
         if (ed.filePath) info[@"filePath"] = ed.filePath;
+        // A large file opened in section mode reopens as the same section, not whole.
+        if (ed.filePath && ed.isSectionMode) {
+            info[@"sectionOffset"] = @(ed.sectionStart);
+            info[@"sectionLength"] = @(ed.requestedSectionLength);
+        }
 
         if (!ed.filePath) {
             // Untitled tab — restore if it has content OR was renamed (#177), so a
@@ -4996,7 +5142,16 @@ static BOOL groupHasTrailingSep(NSString *ident) {
         // Use addNewTab so we can configure the editor directly
         EditorView *ed = [_tabManager addNewTab];
         NSError *err;
-        if (![ed loadFileAtPath:loadPath error:&err]) { [_tabManager closeEditor:ed]; continue; }
+        NSNumber *sectionLen = info[@"sectionLength"];
+        BOOL loaded;
+        if (!fromBackup && sectionLen.unsignedLongLongValue > 0) {
+            loaded = [ed loadSectionOfFileAtPath:loadPath
+                                          offset:[info[@"sectionOffset"] unsignedLongLongValue]
+                                          length:sectionLen.unsignedLongLongValue error:&err];
+        } else {
+            loaded = [ed loadFileAtPath:loadPath error:&err];
+        }
+        if (!loaded) { [_tabManager closeEditor:ed]; continue; }
 
         if (fromBackup) {
             // Restore untitled index so tab name and future backup filename match
@@ -11799,8 +11954,15 @@ static NSString *languageDisplayName(NSString *langCode) {
     sptr_t docLength = [ed.scintillaView message:SCI_GETLENGTH wParam:0 lParam:0];
     _statusLeft.stringValue  = [NSString stringWithFormat:@"Ln %ld, Col %ld  |  Length: %ld  |  Lines: %ld  |  Zoom: %ld%%",
                                  (long)ed.cursorLine, (long)ed.cursorColumn, (long)docLength, (long)ed.lineCount, (long)ed.zoomPercentage];
-    if (ed.sectionDescription)   // section mode: say which part of the file is shown
-        _statusLeft.stringValue = [NSString stringWithFormat:@"%@  |  %@", ed.sectionDescription, _statusLeft.stringValue];
+    // Section mode: the range is a button that opens the part chooser.
+    BOOL inSection = ed.sectionDescription != nil;
+    _sectionButton.hidden = !inSection;
+    _statusLeftAtEdge.active = !inSection;
+    _statusLeftAfterSection.active = inSection;
+    if (inSection) {
+        _sectionButton.title = [ed.sectionDescription stringByAppendingString:@" \u2304"];
+        [self _refreshSectionPopover];
+    }
     NSString *lang = languageDisplayName(ed.currentLanguage);
     NSString *mode = ed.isOverwriteMode ? @"OVR" : @"INS";
     _statusRight.stringValue = [NSString stringWithFormat:@"%@  |  %@  |  %@  |  %@",
@@ -11811,6 +11973,19 @@ static NSString *languageDisplayName(NSString *langCode) {
 // right-aligned status string) opens the Language menu, like Notepad++ on
 // Windows. Only the language token responds — the encoding/EOL/mode segments are
 // ignored — and nothing about the status bar's appearance changes.
+// Clicking the "Ln x, Col y" token runs the same command as Search > Go to… (goToLine:).
+- (void)_statusBarLineClicked:(NSClickGestureRecognizer *)gr {
+    if (![self currentEditor] || !_statusLeft.stringValue.length) return;
+    NSString *left = _statusLeft.stringValue;
+    NSRange bar = [left rangeOfString:@"  |"];
+    NSString *token = bar.location == NSNotFound ? left : [left substringToIndex:bar.location];   // "Ln x, Col y"
+    CGFloat w = [token sizeWithAttributes:@{ NSFontAttributeName: _statusLeft.font }].width;
+    const CGFloat left0 = NSMinX(_statusLeft.frame);
+    const NSPoint p = [gr locationInView:_statusBar];
+    if (p.x < left0 - 4 || p.x > left0 + w + 4) return;
+    [self goToLine:nil];
+}
+
 - (void)_statusBarDoubleClicked:(NSClickGestureRecognizer *)gr {
     EditorView *ed = [self currentEditor];
     if (!ed) return;
